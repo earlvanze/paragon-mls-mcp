@@ -1,6 +1,17 @@
 ---
 name: paragon-mls
 description: "Fetch real estate listings from Paragon MLS (paragonrels.com / fnimls.com) APIs and perform four-square rental property analysis. Use when: (1) looking up MLS property details by MLS number or listing ID, (2) analyzing rental properties for cash flow and cash-on-cash return, (3) comparing multiple investment properties, (4) extracting structured data from Paragon MLS listings. Supports any Paragon-backed MLS region (globalmls, imls, hudson, gamls, triangle, etc.)."
+metadata:
+  openclaw:
+    requires:
+      bins:
+        - node
+    mcp:
+      paragon-mls:
+        command: node
+        args:
+          - dist/index.js
+        cwd: ..
 ---
 
 # Paragon MLS
