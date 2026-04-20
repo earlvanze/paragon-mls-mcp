@@ -10,8 +10,7 @@ metadata:
       paragon-mls:
         command: node
         args:
-          - dist/index.js
-        cwd: ..
+          - /home/umbrel/.openclaw/workspace/deal-analyst/paragon-mls-mcp/dist/index.js
 ---
 
 # Paragon MLS
