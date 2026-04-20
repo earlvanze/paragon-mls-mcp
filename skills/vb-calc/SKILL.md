@@ -1,6 +1,6 @@
 ---
-name: paragon-mls-vb-calc
-description: "Compare amortized debt, extra payments, chunking/basic acceleration, and advanced velocity banking for a real estate deal. Use when deciding whether chunking or advanced VB makes sense for a property."
+name: vb-calc
+description: "Compare amortized debt, extra payments, chunking/basic acceleration, and advanced velocity banking for a real estate deal. Use when deciding whether chunking or advanced VB makes sense for a property, even when the numbers come from a generic source rather than Paragon MLS."
 metadata:
   openclaw:
     requires:
@@ -13,7 +13,7 @@ metadata:
           - /home/umbrel/.openclaw/workspace/deal-analyst/paragon-mls-mcp/dist/index.js
 ---
 
-# Paragon MLS VB Calc
+# VB Calc
 
 Use the `paragon-mls.vb_calc` MCP tool to compare debt payoff strategies for a deal.
 

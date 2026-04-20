@@ -1,6 +1,6 @@
 ---
-name: paragon-mls-analyze-deal
-description: "Run spreadsheet-compatible Four-Square rental analysis for Paragon MLS deals. Use when evaluating rental properties for cash flow, NOI, DSCR, appreciation, depreciation, ROI, ROE, and IRR using the Google Sheet model."
+name: analyze-deal
+description: "Run spreadsheet-compatible Four-Square rental analysis for real estate deals. Use when evaluating properties for cash flow, NOI, DSCR, appreciation, depreciation, ROI, ROE, and IRR using the Google Sheet model, even when the inputs are already known and not coming directly from Paragon MLS."
 metadata:
   openclaw:
     requires:
@@ -13,7 +13,7 @@ metadata:
           - /home/umbrel/.openclaw/workspace/deal-analyst/paragon-mls-mcp/dist/index.js
 ---
 
-# Paragon MLS Analyze Deal
+# Analyze Deal
 
 Use the `paragon-mls.analyze_deal` MCP tool for spreadsheet-compatible Four-Square rental analysis.
 
@@ -21,7 +21,7 @@ This skill is for actual investment underwriting, not just property lookup. It m
 
 ## Typical use
 
-- run full rental underwriting on one or more MLS listings
+- run full rental underwriting on one or more properties or listings
 - compare multiple deals with the same assumptions
 - override taxes, insurance, rent, or rehab inputs to match real underwriting notes
 - produce sheet-style outputs without manually filling the spreadsheet
