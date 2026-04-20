@@ -1013,7 +1013,7 @@ function formatVbSummary(result: VbComparison): string {
 
 const server = new McpServer({
   name: "paragon-mls",
-  version: "1.1.0",
+  version: "1.1.2",
   description: "Paragon MLS real estate API — fetch listings, parse property data, analyze deals with the Four-Square spreadsheet model, and compare velocity banking scenarios",
 });
 

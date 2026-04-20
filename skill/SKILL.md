@@ -1,6 +1,6 @@
 ---
 name: paragon-mls
-description: "Fetch real estate listings from Paragon MLS (paragonrels.com / fnimls.com) APIs and perform four-square rental property analysis. Use when: (1) looking up MLS property details by MLS number or listing ID, (2) analyzing rental properties for cash flow and cash-on-cash return, (3) comparing multiple investment properties, (4) extracting structured data from Paragon MLS listings. Supports any Paragon-backed MLS region (globalmls, imls, hudson, gamls, triangle, etc.)."
+description: "Umbrella skill for Paragon MLS work. Use when a request broadly involves Paragon MLS listings, links, or downstream analysis and you still need to decide whether to fetch one property, unpack a shared GUID, inspect raw payloads, or hand off to deal analysis. Supports any Paragon-backed MLS region (globalmls, imls, hudson, gamls, triangle, etc.)."
 metadata:
   openclaw:
     requires:
@@ -15,7 +15,17 @@ metadata:
 
 # Paragon MLS
 
-Fetch real estate listings from Paragon MLS APIs and analyze rental investment properties.
+Umbrella skill for Paragon MLS workflows.
+
+Use this when the user is clearly asking for Paragon MLS help, but the exact narrower skill is not obvious yet. If the request is already specific, prefer the narrower skills directly.
+
+## Prefer these narrower skills when possible
+
+- `paragon-mls-fetch-property` for one MLS listing
+- `paragon-mls-fetch-listings` for a shared GUID or collaboration link
+- `paragon-mls-raw-listings` for source JSON and parser debugging
+- `analyze-deal` for Four-Square underwriting, including generic non-Paragon inputs
+- `vb-calc` for generic debt payoff and velocity banking comparisons
 
 ## Quick Start
 
@@ -54,6 +64,8 @@ mcporter call paragon-mls.raw_listings mlsNumbers="201918514" systemId="globalml
 ```
 
 ## Tools
+
+This umbrella skill exists to cover the whole Paragon surface. In most cases, once intent is clear, route to the most specific tool or narrower skill below.
 
 ### `fetch_listings`
 Fetch all property listings from a Paragon MLS listing GUID. Returns parsed property data for all active listings.

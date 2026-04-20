@@ -20,7 +20,16 @@ npm run build
 
 ## Usage with OpenClaw
 
-The server is already wired into the OpenClaw gateway config (`mcp.servers.paragon-mls`). After restart, the four tools will be available to all agents.
+The server is already wired into the OpenClaw gateway config (`mcp.servers.paragon-mls`). After restart, all five tools will be available to all agents.
+
+This repo also ships the companion ClawHub skills:
+
+- `paragon-mls` as the umbrella skill
+- `paragon-mls-fetch-property`
+- `paragon-mls-fetch-listings`
+- `paragon-mls-raw-listings`
+- `analyze-deal`
+- `vb-calc`
 
 You can also call it directly:
 
@@ -46,6 +55,16 @@ Common Paragon MLS system IDs (the subdomain before `.paragonrels.com`):
 | Hudson County, NJ | `hudson` |
 | Georgia | `gamls` |
 | Triangle Region, NC | `triangle` |
+
+## Skill layout
+
+- Use `paragon-mls` when the request is broadly about Paragon MLS and the exact tool is not obvious yet.
+- Use the narrower skills when the task is specific:
+  - `paragon-mls-fetch-property` for one listing
+  - `paragon-mls-fetch-listings` for a shared GUID or collaboration link
+  - `paragon-mls-raw-listings` for parser debugging
+  - `analyze-deal` for generic Four-Square underwriting, even when the inputs do not come directly from Paragon MLS
+  - `vb-calc` for generic payoff strategy and velocity banking comparisons
 
 ## Architecture
 
