@@ -10,7 +10,6 @@
  * Security hardening:
  *   - Input validation via Zod schemas on all tool inputs
  *   - No secrets in responses (addresses/MLS numbers only, never auth tokens)
- *   - Rate-limit aware (configurable delays between API calls)
  *   - Timeout guards on all HTTP requests
  *   - No filesystem writes — all output is returned as structured data
  *   - Sanitized URLs in error messages
@@ -19,10 +18,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
 
 interface PropertyInfo {
   address: string;
@@ -33,7 +28,7 @@ interface PropertyInfo {
   mlsNumber: string;
   priceCurrent: number | null;
   pricePrev: number | null;
-  offerPrice: number | null;
+  offerPriceDefault: number | null;
   beds: number | null;
   bathsFull: number | null;
   bathsPart: number | null;
@@ -43,41 +38,58 @@ interface PropertyInfo {
   type: string | null;
   status: string | null;
   publicRemarks: string | null;
-  rents: Record<string, number | null>;
+  rents: Array<number | null>;
+  laundryIncome: number | null;
+  storageIncome: number | null;
+  miscIncome: number | null;
   totalTaxes: number | null;
   schoolTaxes: number | null;
   hoa: number | null;
+  unitCount: number | null;
+  styleTypeBedBath: string | null;
   mlsLink: string;
   googleMapsLink: string;
 }
 
-interface FourSquareAnalysis {
+interface FourSquareRow {
   address: string;
   mlsNumber: string;
-  listPrice: number | null;
-  offerPrice: number | null;
-  rents: Record<string, number | null>;
-  totalMonthlyIncome: number;
-  monthlyTaxes: number;
-  monthlyInsurance: number;
-  monthlyMortgage: number | null;
-  totalMonthlyExpenses: number;
-  monthlyCashFlow: number | null;
-  annualCashFlow: number | null;
-  totalInvestment: number | null;
-  cashOnCashReturn: number | null;
-  capRate: number | null;
-  sqft: number | null;
-  yearBuilt: number | null;
-  beds: number | null;
-  baths: string | null;
-  status: string | null;
-  publicRemarks: string | null;
+  offerPrice: number;
+  totalMonthlyCashFlow: number;
+  cashOnCashReturn: number;
+  capitalizationRate: number;
+  debtServiceCoverageRatio: number | null;
+  totalAnnualizedReturn: number;
+  returnOnInvestment: number;
+  returnOnEquity: number;
+  internalRateOfReturn: number | null;
+  sheetColumns: Record<string, string | number | null>;
 }
 
-// ---------------------------------------------------------------------------
-// Paragon MLS API Client
-// ---------------------------------------------------------------------------
+interface VbScenario {
+  monthsToPayoff: number | null;
+  yearsToPayoff: number | null;
+  totalInterestPaid: number;
+  effectiveInterestRate: number | null;
+}
+
+interface VbComparison {
+  amortizedDebt: VbScenario;
+  amortizedDebtWithExtraPayments: VbScenario;
+  debtWithBasicAcceleration: VbScenario;
+  advancedDebtAcceleration: VbScenario;
+  savings: {
+    extraPaymentsVsAmortized: number;
+    basicAccelerationVsAmortized: number;
+    advancedVsAmortized: number;
+  };
+  recommendation: {
+    bestStrategy: "amortized" | "extra_payments" | "basic_acceleration" | "advanced_acceleration";
+    rationale: string;
+    chunkingMakesSense: boolean;
+    advancedMakesSense: boolean;
+  };
+}
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_USER_AGENT =
@@ -89,9 +101,6 @@ const PARAGON_GUID_URL_TEMPLATE =
 const PARAGON_NOTIFICATION_URL_TEMPLATE =
   "http://{systemId}.paragonrels.com/CollabLink/public/BlazePublicGetRequest?ApiAction=GetNotificationAppData%2F&UrlData={mlsId}";
 
-/**
- * Safe dict-path query (mirrors the original DictQuery utility).
- */
 function dictQuery(obj: unknown, path: string, defaultValue: unknown = null): unknown {
   const keys = path.split("/");
   let val: unknown = obj;
@@ -113,18 +122,122 @@ function str(val: unknown): string {
 }
 
 function num(val: unknown): number | null {
-  if (val == null) return null;
-  const n = Number(val);
+  if (val == null || val === "") return null;
+  const n = Number(String(val).replace(/,/g, ""));
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseMoney(val: unknown): number | null {
+  if (val == null || val === "") return null;
+  const cleaned = String(val).replace(/[$,%\s,]/g, "");
+  if (cleaned === "") return null;
+  const n = Number(cleaned);
   return Number.isFinite(n) ? n : null;
 }
 
 function stripNonNumeric(s: string): string {
-  return s.replace(/[^0-9.]/g, "");
+  return s.replace(/[^0-9.\-]/g, "");
 }
 
-/**
- * Fetch JSON from a Paragon endpoint with timeout and error handling.
- */
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+function round6(n: number): number {
+  return Math.round(n * 1_000_000) / 1_000_000;
+}
+
+function safeDivide(a: number, b: number): number | null {
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b === 0) return null;
+  return a / b;
+}
+
+function pmt(ratePerPeriod: number, periods: number, presentValue: number): number {
+  if (periods <= 0) return 0;
+  if (ratePerPeriod === 0) return presentValue / periods;
+  const factor = Math.pow(1 + ratePerPeriod, periods);
+  return (presentValue * ratePerPeriod * factor) / (factor - 1);
+}
+
+function cumulativePrincipal(ratePerPeriod: number, periods: number, presentValue: number, startPeriod: number, endPeriod: number): number {
+  if (presentValue <= 0 || periods <= 0 || endPeriod < startPeriod) return 0;
+  let balance = presentValue;
+  const payment = pmt(ratePerPeriod, periods, presentValue);
+  let totalPrincipal = 0;
+  for (let period = 1; period <= periods && balance > 0.000001; period++) {
+    const interest = balance * ratePerPeriod;
+    const principal = Math.min(balance, payment - interest);
+    if (period >= startPeriod && period <= endPeriod) {
+      totalPrincipal += principal;
+    }
+    balance = Math.max(0, balance - principal);
+  }
+  return totalPrincipal;
+}
+
+function irr(cashflows: number[]): number | null {
+  if (cashflows.length < 2) return null;
+  const hasPositive = cashflows.some((v) => v > 0);
+  const hasNegative = cashflows.some((v) => v < 0);
+  if (!hasPositive || !hasNegative) return null;
+
+  let guess = 0.1;
+  for (let i = 0; i < 100; i++) {
+    let npv = 0;
+    let derivative = 0;
+    for (let t = 0; t < cashflows.length; t++) {
+      const denom = Math.pow(1 + guess, t);
+      npv += cashflows[t] / denom;
+      if (t > 0) derivative -= (t * cashflows[t]) / Math.pow(1 + guess, t + 1);
+    }
+    if (Math.abs(npv) < 1e-8) return guess;
+    if (Math.abs(derivative) < 1e-12) break;
+    const next = guess - npv / derivative;
+    if (!Number.isFinite(next) || next <= -0.999999) break;
+    guess = next;
+  }
+
+  let low = -0.9999;
+  let high = 10;
+  const npvAt = (rate: number) => cashflows.reduce((sum, cf, t) => sum + cf / Math.pow(1 + rate, t), 0);
+  let lowNpv = npvAt(low);
+  let highNpv = npvAt(high);
+  if (lowNpv * highNpv > 0) return null;
+  for (let i = 0; i < 200; i++) {
+    const mid = (low + high) / 2;
+    const midNpv = npvAt(mid);
+    if (Math.abs(midNpv) < 1e-8) return mid;
+    if (lowNpv * midNpv <= 0) {
+      high = mid;
+      highNpv = midNpv;
+    } else {
+      low = mid;
+      lowNpv = midNpv;
+    }
+  }
+  return (low + high) / 2;
+}
+
+function inferUnitCount(rents: Array<number | null>, notes: string, fallback: number | null = null): number | null {
+  const populated = rents.filter((r) => (r ?? 0) > 0).length;
+  if (populated > 0) return populated;
+  const match = notes.match(/(\d+)\s*(unit|family|plex|condo)/i);
+  if (match) return Number(match[1]);
+  return fallback;
+}
+
+function buildStyleTypeBedBath(p: { style: string | null; type: string | null; beds: number | null; bathsFull: number | null; bathsPart: number | null; yearBuilt: number | null; }): string | null {
+  const lines: string[] = [];
+  if (p.style) lines.push(p.style);
+  if (p.type && p.type !== p.style) lines.push(p.type);
+  if (p.beds != null || p.bathsFull != null || p.bathsPart != null) {
+    const baths = p.bathsFull != null || p.bathsPart != null ? `${p.bathsFull ?? 0}.${p.bathsPart ?? 0}` : "?";
+    lines.push(`${p.beds ?? "?"}BD/${baths}BA`);
+  }
+  if (p.yearBuilt != null) lines.push(`Built ${p.yearBuilt}`);
+  return lines.length > 0 ? lines.join("\n") : null;
+}
+
 async function paragonFetch(
   url: string,
   options: { headers?: Record<string, string>; timeoutMs?: number } = {}
@@ -149,9 +262,6 @@ async function paragonFetch(
   }
 }
 
-/**
- * Get a GUID from the Paragon system for API calls.
- */
 async function getGuid(systemId: string, headers: Record<string, string>): Promise<string> {
   const url = PARAGON_GUID_URL_TEMPLATE.replace("{systemId}", encodeURIComponent(systemId));
   const controller = new AbortController();
@@ -165,9 +275,6 @@ async function getGuid(systemId: string, headers: Record<string, string>): Promi
   }
 }
 
-/**
- * Get MLS numbers and cookie data from a Paragon listing ID.
- */
 async function getMlsNumbers(
   mlsId: string,
   systemId: string
@@ -182,8 +289,7 @@ async function getMlsNumbers(
 
   let listings: Array<{ Id: string }> = [];
   try {
-    const raw = str(data);
-    // Handle [] in response (original code splits on '[]')
+    const raw = JSON.stringify(data);
     const cleaned = raw.includes("[]") ? raw.split("[]")[0] : raw;
     const parsed = JSON.parse(cleaned);
     listings = parsed?.listings ?? [];
@@ -191,13 +297,9 @@ async function getMlsNumbers(
     listings = [];
   }
 
-  const mlsNumbers = listings.map((l) => l.Id);
-  return { mlsNumbers, agentId, officeId };
+  return { mlsNumbers: listings.map((l) => l.Id), agentId, officeId };
 }
 
-/**
- * Fetch property details for one or more MLS numbers.
- */
 async function getProperties(
   mlsNumbers: string[],
   systemId: string,
@@ -230,10 +332,6 @@ async function getProperties(
   return results;
 }
 
-// ---------------------------------------------------------------------------
-// Property Parsing
-// ---------------------------------------------------------------------------
-
 function parseProperty(data: Record<string, unknown>, systemId: string, mlsId: string): PropertyInfo | null {
   try {
     const propInfo = (dictQuery(data, "PROP_INFO") ?? {}) as Record<string, unknown>;
@@ -246,88 +344,107 @@ function parseProperty(data: Record<string, unknown>, systemId: string, mlsId: s
     const fullAddress = `${address}, ${city}, ${state} ${zip}`.trim();
 
     const mlsNumber = histData.length > 0 ? str(histData[0]?.MLS_NUMBER) : "";
-    const priceCurrent = num(dictQuery(propInfo, "PRICE_CURRENT"));
-    const pricePrev = num(dictQuery(propInfo, "PRICE_PREV"));
-    const offerPrice = priceCurrent != null ? Math.round(priceCurrent * 0.85) : null;
+    const priceCurrent = parseMoney(dictQuery(propInfo, "PRICE_CURRENT"));
+    const pricePrev = parseMoney(dictQuery(propInfo, "PRICE_PREV"));
+    const offerPriceDefault = priceCurrent;
     const beds = num(dictQuery(propInfo, "BDRMS"));
     const bathsFull = num(dictQuery(propInfo, "BATHS_FULL"));
     const bathsPart = num(dictQuery(propInfo, "BATHS_PART"));
     const publicRemarks = str(dictQuery(propInfo, "REMARKS_GENERAL"));
     const status = str(dictQuery(propInfo, "STATUS_LONG"));
 
-    // Parse detail options — try new format then old format
     let sqft: number | null = null;
     let yearBuilt: number | null = null;
     let style: string | null = null;
-    let type: string | null = str(dictQuery(propInfo, "PROP_TYPE_LONG"));
-    let rents: Record<string, number | null> = {};
+    let type: string | null = str(dictQuery(propInfo, "PROP_TYPE_LONG")) || null;
+    const rents: Array<number | null> = [null, null, null, null, null, null, null];
+    let laundryIncome: number | null = null;
+    let storageIncome: number | null = null;
+    let miscIncome: number | null = null;
     let totalTaxes: number | null = null;
     let schoolTaxes: number | null = null;
     let hoa: number | null = null;
 
     const detailOptions = dictQuery(propInfo, "DetailOptions");
 
+    const readKvFromSection = (sectionData: Array<Record<string, unknown>>): Record<string, string> => {
+      const kv: Record<string, string> = {};
+      for (const item of sectionData) {
+        const label = str(item.Label ?? item.label);
+        const value = str(item.Value ?? item.value);
+        if (label) kv[label] = value;
+      }
+      return kv;
+    };
+
     if (Array.isArray(detailOptions)) {
-      // New format: [{SectionName, Data: [{Label, Value}]}]
       for (const section of detailOptions) {
         const sectionName = str(dictQuery(section, "SectionName"));
         const sectionData = dictQuery(section, "Data") as Array<Record<string, unknown>> | null;
         if (!Array.isArray(sectionData)) continue;
-
-        const kv: Record<string, string> = {};
-        for (const item of sectionData) {
-          const label = str(item.Label ?? item.label);
-          const value = str(item.Value ?? item.value);
-          if (label) kv[label] = value;
-        }
+        const kv = readKvFromSection(sectionData);
 
         if (sectionName === "Property Information") {
           yearBuilt = num(kv["Year Built"]);
           type = kv["Type"] ?? type;
         } else if (sectionName === "Features") {
-          style = kv["STYLE"];
+          style = kv["STYLE"] ?? style;
+          sqft = parseMoney(kv["Above Ground SQFT"]) ?? sqft;
         } else if (sectionName === "Miscellaneous") {
-          sqft = num(kv["Above Ground SQFT"]);
+          sqft = parseMoney(kv["Above Ground SQFT"]) ?? sqft;
           const taxStr = stripNonNumeric(kv["Total Taxes"] ?? "");
-          totalTaxes = taxStr ? Math.round(parseInt(taxStr) / 12) : null;
-          // Unit rents
+          totalTaxes = taxStr ? Math.round(Number(taxStr) / 12) : totalTaxes;
+          const hoaStr = stripNonNumeric(kv["HOA Fees"] ?? "");
+          hoa = hoaStr ? Number(hoaStr) : hoa;
+          const laundryStr = stripNonNumeric(kv["Laundry Income"] ?? "");
+          laundryIncome = laundryStr ? Number(laundryStr) : laundryIncome;
+          const storageStr = stripNonNumeric(kv["Storage Income"] ?? "");
+          storageIncome = storageStr ? Number(storageStr) : storageIncome;
+          const miscStr = stripNonNumeric(kv["Misc Income"] ?? kv["Miscellaneous Income"] ?? "");
+          miscIncome = miscStr ? Number(miscStr) : miscIncome;
           for (let u = 1; u <= 7; u++) {
-            const rentVal = kv[`Unit ${u} Monthly Rent`];
-            if (rentVal) rents[`Unit ${u}`] = num(rentVal.replace(",", ""));
+            const rentVal = kv[`Unit ${u} Monthly Rent`] ?? kv[`Unit ${u} Rent`];
+            if (rentVal) rents[u - 1] = parseMoney(rentVal);
           }
-          hoa = num(kv["HOA Fees"]);
         } else if (sectionName === "Schools") {
           const stStr = stripNonNumeric(kv["School Taxes"] ?? "");
-          schoolTaxes = stStr ? Math.round(parseInt(stStr) / 12) : null;
+          schoolTaxes = stStr ? Math.round(Number(stStr) / 12) : schoolTaxes;
         }
       }
     }
 
-    // Fallback old format: DetailOptions.Data is a list of lists
-    if (sqft == null && detailOptions != null && !Array.isArray(detailOptions)) {
+    if (detailOptions != null && !Array.isArray(detailOptions)) {
       const dataArr = dictQuery(detailOptions, "Data") as Array<Array<Record<string, string>>> | null;
-      if (Array.isArray(dataArr) && dataArr.length >= 2) {
-        const propInfoList = dataArr[0] ?? [];
-        const schoolsList = dataArr[1] ?? [];
-        const kv: Record<string, string> = {};
-        for (const item of propInfoList) {
-          kv[item.Label ?? item.label] = item.Value ?? item.value ?? "";
+      if (Array.isArray(dataArr)) {
+        const flatKv: Record<string, string> = {};
+        for (const group of dataArr) {
+          for (const item of group ?? []) {
+            flatKv[item.Label ?? item.label] = item.Value ?? item.value ?? "";
+          }
         }
-        yearBuilt = num(kv["Year Built"]);
-        type = kv["Type"] ?? type;
-        const taxStr = stripNonNumeric(kv["Total Taxes"] ?? "");
-        totalTaxes = taxStr ? Math.round(parseInt(taxStr) / 12) : null;
+        yearBuilt = num(flatKv["Year Built"]) ?? yearBuilt;
+        type = flatKv["Type"] ?? type;
+        style = flatKv["STYLE"] ?? style;
+        sqft = parseMoney(flatKv["Above Ground SQFT"]) ?? sqft;
+        const taxStr = stripNonNumeric(flatKv["Total Taxes"] ?? "");
+        totalTaxes = taxStr ? Math.round(Number(taxStr) / 12) : totalTaxes;
+        const schoolStr = stripNonNumeric(flatKv["School Taxes"] ?? "");
+        schoolTaxes = schoolStr ? Math.round(Number(schoolStr) / 12) : schoolTaxes;
+        const hoaStr = stripNonNumeric(flatKv["HOA Fees"] ?? "");
+        hoa = hoaStr ? Number(hoaStr) : hoa;
         for (let u = 1; u <= 7; u++) {
-          const rentVal = kv[`Unit ${u} Rent`];
-          if (rentVal) rents[`Unit ${u}`] = num(rentVal.replace(",", ""));
+          const rentVal = flatKv[`Unit ${u} Monthly Rent`] ?? flatKv[`Unit ${u} Rent`];
+          if (rentVal) rents[u - 1] = parseMoney(rentVal);
         }
       }
     }
 
-    const mlsLink = `http://${systemId}.paragonrels.com/publink/Report.aspx?GUID=${mlsId}&ListingID=${mlsNumber}:0&layout_id=3`;
+    const unitCount = inferUnitCount(rents, `${type ?? ""}\n${publicRemarks}`);
+    const styleTypeBedBath = buildStyleTypeBedBath({ style, type, beds, bathsFull, bathsPart, yearBuilt });
+    const guidForLink = mlsId || mlsNumber;
+    const mlsLink = `http://${systemId}.paragonrels.com/publink/Report.aspx?GUID=${guidForLink}&ListingID=${mlsNumber}:0&layout_id=3`;
     const googleMapsLink = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(fullAddress)}`;
 
-    // Only return active/pending listings
     if (status && !/Active|New|Price Change|Pend/i.test(status)) {
       return null;
     }
@@ -341,7 +458,7 @@ function parseProperty(data: Record<string, unknown>, systemId: string, mlsId: s
       mlsNumber,
       priceCurrent,
       pricePrev,
-      offerPrice,
+      offerPriceDefault,
       beds,
       bathsFull,
       bathsPart,
@@ -352,9 +469,14 @@ function parseProperty(data: Record<string, unknown>, systemId: string, mlsId: s
       status,
       publicRemarks,
       rents,
+      laundryIncome,
+      storageIncome,
+      miscIncome,
       totalTaxes,
       schoolTaxes,
       hoa,
+      unitCount,
+      styleTypeBedBath,
       mlsLink,
       googleMapsLink,
     };
@@ -363,84 +485,479 @@ function parseProperty(data: Record<string, unknown>, systemId: string, mlsId: s
   }
 }
 
-// ---------------------------------------------------------------------------
-// Four-Square Analysis
-// ---------------------------------------------------------------------------
+const optionalMoney = z.number().nullable().optional();
 
-function computeFourSquare(p: PropertyInfo): FourSquareAnalysis {
-  const totalMonthlyIncome = Object.values(p.rents)
-    .filter((r): r is number => r != null)
-    .reduce((sum, r) => sum + r, 0);
+const analyzeDealSchema = {
+  mlsNumbers: z.string().describe("Comma-separated MLS numbers to analyze (e.g. '201918514,202012345')"),
+  systemId: z.string().default("globalmls").describe("MLS system/region ID"),
+  mlsId: z.string().optional().describe("Optional listing GUID for link generation"),
+  holdingPeriodYears: z.number().default(5).describe("Holding period in years, like the spreadsheet's B2 value"),
+  offerPricePct: z.number().default(1).describe("Multiply list price by this to produce Offer Price. Default 1.0 = use list price as offer."),
+  downPaymentPct: z.number().default(0.20).describe("Down payment percentage (sheet column D)"),
+  interestRate: z.number().default(0.07).describe("Mortgage interest rate (sheet column E)"),
+  loanTermYears: z.number().default(30).describe("Mortgage term in years"),
+  vacancyRate: z.number().default(0.05).describe("Vacancy rate used for monthly Vacancy expense"),
+  repairsPct: z.number().default(0.05).describe("Monthly Repairs expense as percent of monthly income"),
+  capexPct: z.number().default(0.05).describe("Monthly Capital Expenditures expense as percent of monthly income"),
+  mgmtPct: z.number().default(0.08).describe("Monthly Property Management expense as percent of monthly income"),
+  appreciationRate: z.number().default(0.03).describe("Annual appreciation assumption"),
+  marginalTaxRate: z.number().default(0.35).describe("Marginal tax rate used for depreciation tax savings"),
+  annualInsuranceRate: z.number().default(0.005).describe("Default annual insurance as a percent of offer price when monthly insurance is not overridden"),
+  closingCosts: z.number().default(0).describe("Upfront closing costs (sheet column AV)"),
+  repairBudget: z.number().default(0).describe("Upfront repair budget / rehab (sheet column AW)"),
+  reservePrepaid: optionalMoney.describe("Override Reserve / Prepaid (sheet column AX). If omitted, use the spreadsheet-compatible formula."),
+  privateMoneyLender: z.number().default(0).describe("Private money lender cost or contribution (sheet column AY)"),
+  landValue: z.number().default(0).describe("Land value used to reduce depreciation basis (sheet column BG)"),
+  monthlyPropertyTaxes: optionalMoney.describe("Override monthly property taxes (sheet column Y)"),
+  monthlySchoolTaxes: optionalMoney.describe("Override monthly school taxes (sheet column Z)"),
+  monthlyInsurance: optionalMoney.describe("Override monthly insurance (sheet column AA)"),
+  monthlyWater: z.number().default(0).describe("Monthly Water expense (AB)"),
+  monthlySewer: z.number().default(0).describe("Monthly Sewer expense (AC)"),
+  monthlyGarbage: z.number().default(0).describe("Monthly Garbage expense (AD)"),
+  monthlyElectric: z.number().default(0).describe("Monthly Electric expense (AE)"),
+  monthlyGas: z.number().default(0).describe("Monthly Gas expense (AF)"),
+  monthlyHoa: optionalMoney.describe("Override monthly HOA fees (AG)"),
+  monthlyLawnSnow: z.number().default(0).describe("Monthly Lawn/Snow expense (AH)"),
+  monthlyLegalAccounting: z.number().default(0).describe("Monthly Legal & Accounting expense (AM)"),
+  laundryIncome: optionalMoney.describe("Override Laundry Income (U)"),
+  storageIncome: optionalMoney.describe("Override Storage Income (V)"),
+  miscIncome: optionalMoney.describe("Override Misc Income (W)"),
+  unitRent1: optionalMoney.describe("Override Rental (Unit 1)"),
+  unitRent2: optionalMoney.describe("Override Rental (Unit 2)"),
+  unitRent3: optionalMoney.describe("Override Rental (Unit 3)"),
+  unitRent4: optionalMoney.describe("Override Rental (Unit 4)"),
+  unitRent5: optionalMoney.describe("Override Rental (Unit 5)"),
+  unitRent6: optionalMoney.describe("Override Rental (Unit 6)"),
+  unitRent7: optionalMoney.describe("Override Rental (Unit 7)"),
+};
 
-  const monthlyTaxes = (p.totalTaxes ?? 0) + (p.schoolTaxes ?? 0);
-  const monthlyInsurance = Math.round((p.priceCurrent ?? 0) * 0.005 / 12); // rough 0.5% annual
-  const vacancy = Math.round(totalMonthlyIncome * 0.05); // 5% vacancy
-  const repairs = Math.round(totalMonthlyIncome * 0.05); // 5% repairs
-  const capex = Math.round(totalMonthlyIncome * 0.05); // 5% capex
-  const mgmt = Math.round(totalMonthlyIncome * 0.08); // 8% management
-  const hoa = p.hoa ?? 0;
+function buildFourSquareRow(
+  property: PropertyInfo,
+  inputs: z.infer<z.ZodObject<typeof analyzeDealSchema>>
+): FourSquareRow {
+  const offerPrice = round2((property.priceCurrent ?? 0) * inputs.offerPricePct);
+  const downPaymentPct = inputs.downPaymentPct;
+  const interestRate = inputs.interestRate;
+  const loanTermMonths = Math.round(inputs.loanTermYears * 12);
+  const rents = [
+    inputs.unitRent1 ?? property.rents[0],
+    inputs.unitRent2 ?? property.rents[1],
+    inputs.unitRent3 ?? property.rents[2],
+    inputs.unitRent4 ?? property.rents[3],
+    inputs.unitRent5 ?? property.rents[4],
+    inputs.unitRent6 ?? property.rents[5],
+    inputs.unitRent7 ?? property.rents[6],
+  ].map((v) => v ?? null);
 
-  const totalMonthlyExpenses =
-    monthlyTaxes + monthlyInsurance + vacancy + repairs + capex + mgmt + hoa;
+  const laundryIncome = inputs.laundryIncome ?? property.laundryIncome ?? 0;
+  const storageIncome = inputs.storageIncome ?? property.storageIncome ?? 0;
+  const miscIncome = inputs.miscIncome ?? property.miscIncome ?? 0;
+  const totalMonthlyIncome = round2(
+    rents.reduce<number>((sum, v) => sum + (v ?? 0), 0) + laundryIncome + storageIncome + miscIncome
+  );
 
-  const monthlyCashFlow = totalMonthlyIncome - totalMonthlyExpenses;
-  const annualCashFlow = monthlyCashFlow * 12;
+  const monthlyPropertyTaxes = round2(inputs.monthlyPropertyTaxes ?? property.totalTaxes ?? 0);
+  const monthlySchoolTaxes = round2(inputs.monthlySchoolTaxes ?? property.schoolTaxes ?? 0);
+  const monthlyInsurance = round2(inputs.monthlyInsurance ?? (offerPrice * inputs.annualInsuranceRate) / 12);
+  const monthlyWater = round2(inputs.monthlyWater);
+  const monthlySewer = round2(inputs.monthlySewer);
+  const monthlyGarbage = round2(inputs.monthlyGarbage);
+  const monthlyElectric = round2(inputs.monthlyElectric);
+  const monthlyGas = round2(inputs.monthlyGas);
+  const monthlyHoa = round2(inputs.monthlyHoa ?? property.hoa ?? 0);
+  const monthlyLawnSnow = round2(inputs.monthlyLawnSnow);
+  const vacancy = round2(totalMonthlyIncome * inputs.vacancyRate);
+  const repairsMonthly = round2(totalMonthlyIncome * inputs.repairsPct);
+  const capexMonthly = round2(totalMonthlyIncome * inputs.capexPct);
+  const propertyManagement = round2(totalMonthlyIncome * inputs.mgmtPct);
+  const legalAccounting = round2(inputs.monthlyLegalAccounting);
 
-  const downPayment = p.priceCurrent != null ? Math.round(p.priceCurrent * 0.20) : null;
-  const closingCosts = p.priceCurrent != null ? Math.round(p.priceCurrent * 0.03) : null;
-  const totalInvestment = downPayment != null && closingCosts != null ? downPayment + closingCosts : null;
+  const loanAmount = Math.max(offerPrice * (1 - downPaymentPct), 0);
+  const mortgage = round2(pmt(interestRate / 12, loanTermMonths, loanAmount));
+  const totalMonthlyExpenses = round2(
+    monthlyPropertyTaxes +
+      monthlySchoolTaxes +
+      monthlyInsurance +
+      monthlyWater +
+      monthlySewer +
+      monthlyGarbage +
+      monthlyElectric +
+      monthlyGas +
+      monthlyHoa +
+      monthlyLawnSnow +
+      vacancy +
+      repairsMonthly +
+      capexMonthly +
+      propertyManagement +
+      legalAccounting +
+      mortgage
+  );
+  const netOperatingIncome = round2(totalMonthlyIncome - totalMonthlyExpenses + mortgage);
+  const totalMonthlyCashFlow = round2(totalMonthlyIncome - totalMonthlyExpenses);
+  const totalAnnualCashFlow = round2(totalMonthlyCashFlow * 12);
+  const downPaymentAmount = round2(downPaymentPct * offerPrice);
+  const closingCosts = round2(inputs.closingCosts);
+  const repairBudget = round2(inputs.repairBudget);
+  const reservePrepaid = round2(
+    inputs.reservePrepaid ??
+      (((monthlyPropertyTaxes + monthlySchoolTaxes + monthlyInsurance) * (12 + 2)) +
+        (((offerPrice - downPaymentPct) * interestRate) / 365) * 30)
+  );
+  const privateMoneyLender = round2(inputs.privateMoneyLender);
+  const totalInvestment = round2(downPaymentAmount + closingCosts + repairBudget + reservePrepaid + privateMoneyLender);
+  const cashOnCashReturn = round6((safeDivide(totalAnnualCashFlow, totalInvestment) ?? 0));
+  const debtServiceCoverageRatio = round6(safeDivide(netOperatingIncome, mortgage) ?? 0);
+  const principalPaydownNoVb = round2(
+    cumulativePrincipal(interestRate / 12, loanTermMonths, loanAmount, 1, Math.round(inputs.holdingPeriodYears * 12))
+  );
+  const projectedAppreciation = round2(offerPrice * Math.pow(1 + inputs.appreciationRate, inputs.holdingPeriodYears) - offerPrice);
+  const totalEquityOverHoldingPeriod = round2(downPaymentAmount + principalPaydownNoVb + projectedAppreciation);
+  const annualReturnDueToEquity = round6(
+    safeDivide((principalPaydownNoVb + projectedAppreciation) / inputs.holdingPeriodYears, totalInvestment) ?? 0
+  );
+  const landValue = round2(inputs.landValue);
+  const depreciationBasis = round2(offerPrice + closingCosts + repairBudget + reservePrepaid - landValue);
+  const annualDepreciation = round2(0.03636 * depreciationBasis);
+  const taxSavingsAtMarginalRate = round2(inputs.marginalTaxRate * annualDepreciation);
+  const annualReturnDueToTaxSavings = round6(safeDivide(taxSavingsAtMarginalRate, totalInvestment) ?? 0);
+  const totalAnnualizedReturn = round2(
+    totalAnnualCashFlow * Math.pow(1 + inputs.appreciationRate, inputs.holdingPeriodYears) +
+      principalPaydownNoVb / inputs.holdingPeriodYears +
+      projectedAppreciation / inputs.holdingPeriodYears +
+      taxSavingsAtMarginalRate
+  );
+  const returnOnInvestment = round6(safeDivide(totalAnnualizedReturn, totalInvestment) ?? 0);
+  const returnOnEquity = round6(safeDivide(totalAnnualizedReturn, totalEquityOverHoldingPeriod) ?? 0);
 
-  const cashOnCashReturn = totalInvestment != null && totalInvestment > 0
-    ? Math.round((annualCashFlow / totalInvestment) * 10000) / 100
-    : null;
+  const annualCashflowAndTaxSavingsYear1 = totalAnnualCashFlow + taxSavingsAtMarginalRate;
+  const annualCashflowSeries: number[] = [];
+  for (let year = 0; year < inputs.holdingPeriodYears; year++) {
+    annualCashflowSeries.push(annualCashflowAndTaxSavingsYear1 * Math.pow(1 + inputs.appreciationRate, year));
+  }
+  const internalRateOfReturn = irr([-totalInvestment, ...annualCashflowSeries, totalEquityOverHoldingPeriod]);
 
-  const capRate = p.priceCurrent != null && p.priceCurrent > 0
-    ? Math.round(((totalMonthlyIncome * 12) / p.priceCurrent) * 10000) / 100
-    : null;
-
-  const baths = p.bathsFull != null && p.bathsPart != null
-    ? `${p.bathsFull}.${p.bathsPart}`
-    : null;
+  const capitalizationRate = round6((safeDivide(netOperatingIncome * 12, offerPrice) ?? 0));
+  const sheetColumns: Record<string, string | number | null> = {
+    "Address": property.fullAddress,
+    "MLS #": property.mlsNumber,
+    "Offer Price": offerPrice,
+    "Down Payment": downPaymentPct,
+    "Mortgage Interest Rate": interestRate,
+    "Total Investment": totalInvestment,
+    "Total Monthly Cash Flow": totalMonthlyCashFlow,
+    "Cash on Cash Return": cashOnCashReturn,
+    "Capitalization Rate": capitalizationRate,
+    "Square Footage Above Ground": property.sqft,
+    "Style, Type, Bed/Bath": property.styleTypeBedBath,
+    "Number of Units": property.unitCount,
+    "Notes": property.publicRemarks,
+    "Rental (Unit 1)": rents[0],
+    "Rental (Unit 2)": rents[1],
+    "Rental (Unit 3)": rents[2],
+    "Rental (Unit 4)": rents[3],
+    "Rental (Unit 5)": rents[4],
+    "Rental (Unit 6)": rents[5],
+    "Rental (Unit 7)": rents[6],
+    "Laundry Income": laundryIncome,
+    "Storage Income": storageIncome,
+    "Misc Income": miscIncome,
+    "Total Monthly Income": totalMonthlyIncome,
+    "Property Taxes (Monthly)": monthlyPropertyTaxes,
+    "School Taxes (Monthly)": monthlySchoolTaxes,
+    "Insurance": monthlyInsurance,
+    "Water": monthlyWater,
+    "Sewer": monthlySewer,
+    "Garbage": monthlyGarbage,
+    "Electric": monthlyElectric,
+    "Gas": monthlyGas,
+    "HOA Fees": monthlyHoa,
+    "Lawn/Snow": monthlyLawnSnow,
+    "Vacancy": vacancy,
+    "Repairs": repairsMonthly,
+    "Capital Expenditures": capexMonthly,
+    "Property Management": propertyManagement,
+    "Legal & Accounting": legalAccounting,
+    "Mortgage": mortgage,
+    "Total Monthly Expenses": totalMonthlyExpenses,
+    "NOI Total Monthly Income": totalMonthlyIncome,
+    "NOI Total Monthly Expenses": totalMonthlyExpenses,
+    "Net Operating Income": netOperatingIncome,
+    "CF Total Monthly Cash Flow": totalMonthlyCashFlow,
+    "Total Annual Cash Flow": totalAnnualCashFlow,
+    "Down Payment Amount": downPaymentAmount,
+    "Closing Costs": closingCosts,
+    "Repairs Budget": repairBudget,
+    "Reserve / Prepaid": reservePrepaid,
+    "Private Money Lender": privateMoneyLender,
+    "Spreadsheet Total Investment": totalInvestment,
+    "Spreadsheet Cash on Cash Return": cashOnCashReturn,
+    "Debt Service Coverage Ratio": debtServiceCoverageRatio,
+    "Principal Paydown (No VB)": principalPaydownNoVb,
+    "Projected Appreciation at 3% per year": projectedAppreciation,
+    "Total Equity Over Holding Period": totalEquityOverHoldingPeriod,
+    "Annual Return Due to Equity": annualReturnDueToEquity,
+    "Land Value": landValue,
+    "Depreciation Basis": depreciationBasis,
+    "Annual Depreciation": annualDepreciation,
+    [`Tax Savings at ${(inputs.marginalTaxRate * 100).toFixed(0)}% Marginal Tax Rate`]: taxSavingsAtMarginalRate,
+    "Annual Return Due to Tax Savings": annualReturnDueToTaxSavings,
+    "Total Annualized Return": totalAnnualizedReturn,
+    "Return on Investment": returnOnInvestment,
+    "Return On Equity": returnOnEquity,
+    "Internal Rate of Return": internalRateOfReturn,
+  };
 
   return {
-    address: p.fullAddress,
-    mlsNumber: p.mlsNumber,
-    listPrice: p.priceCurrent,
-    offerPrice: p.offerPrice,
-    rents: p.rents,
-    totalMonthlyIncome,
-    monthlyTaxes,
-    monthlyInsurance,
-    monthlyMortgage: null, // requires mortgage calc inputs
-    totalMonthlyExpenses,
-    monthlyCashFlow,
-    annualCashFlow,
-    totalInvestment,
+    address: property.fullAddress,
+    mlsNumber: property.mlsNumber,
+    offerPrice,
+    totalMonthlyCashFlow,
     cashOnCashReturn,
-    capRate,
-    sqft: p.sqft,
-    yearBuilt: p.yearBuilt,
-    beds: p.beds,
-    baths,
-    status: p.status,
-    publicRemarks: p.publicRemarks,
+    capitalizationRate,
+    debtServiceCoverageRatio,
+    totalAnnualizedReturn,
+    returnOnInvestment,
+    returnOnEquity,
+    internalRateOfReturn,
+    sheetColumns,
   };
 }
 
-// ---------------------------------------------------------------------------
-// MCP Server Definition
-// ---------------------------------------------------------------------------
+function simulateAmortizedDebt(balance: number, annualRate: number, termMonths: number, extraPayment = 0): VbScenario {
+  const payment = pmt(annualRate / 12, termMonths, balance);
+  let remaining = balance;
+  let months = 0;
+  let interestPaid = 0;
+  while (remaining > 0.01 && months < 1200) {
+    const interest = remaining * annualRate / 12;
+    const totalPayment = Math.min(remaining + interest, payment + extraPayment);
+    const principal = Math.max(0, totalPayment - interest);
+    interestPaid += interest;
+    remaining = Math.max(0, remaining - principal);
+    months += 1;
+  }
+  return {
+    monthsToPayoff: months < 1200 ? months : null,
+    yearsToPayoff: months < 1200 ? months / 12 : null,
+    totalInterestPaid: round2(interestPaid),
+    effectiveInterestRate: annualRate,
+  };
+}
+
+function simulateBasicAcceleration(params: {
+  debtBalance: number;
+  interestRate: number;
+  termMonths: number;
+  helocRate: number;
+  helocLimit: number;
+  freeCashflow: number;
+  chunkMonths: number;
+}): VbScenario {
+  const payment = pmt(params.interestRate / 12, params.termMonths, params.debtBalance);
+  let mortgageBalance = params.debtBalance;
+  let helocBalance = 0;
+  let months = 0;
+  let totalInterest = 0;
+  const recurringChunk = Math.max(0, params.freeCashflow * params.chunkMonths);
+  const initialChunk = Math.min(mortgageBalance, Math.max(0, params.helocLimit + recurringChunk));
+  if (initialChunk > 0) {
+    mortgageBalance -= initialChunk;
+    helocBalance += initialChunk;
+  }
+
+  while ((mortgageBalance > 0.01 || helocBalance > 0.01) && months < 1200) {
+    months += 1;
+
+    if (mortgageBalance > 0.01) {
+      const mortgageInterest = mortgageBalance * params.interestRate / 12;
+      totalInterest += mortgageInterest;
+      const mortgagePayment = Math.min(mortgageBalance + mortgageInterest, payment);
+      const mortgagePrincipal = Math.max(0, mortgagePayment - mortgageInterest);
+      mortgageBalance = Math.max(0, mortgageBalance - mortgagePrincipal);
+    }
+
+    const helocInterest = helocBalance > 0 ? helocBalance * params.helocRate / 12 : 0;
+    totalInterest += helocInterest;
+    helocBalance += helocInterest;
+
+    if (params.freeCashflow > 0 && helocBalance > 0) {
+      const payHeloc = Math.min(helocBalance, params.freeCashflow);
+      helocBalance -= payHeloc;
+    }
+
+    if (mortgageBalance > 0.01 && recurringChunk > 0 && months % (params.chunkMonths + 1) === 0) {
+      const chunk = Math.min(mortgageBalance, recurringChunk);
+      mortgageBalance -= chunk;
+      helocBalance += chunk;
+    }
+  }
+
+  return {
+    monthsToPayoff: months < 1200 ? months : null,
+    yearsToPayoff: months < 1200 ? months / 12 : null,
+    totalInterestPaid: round2(totalInterest),
+    effectiveInterestRate: params.interestRate,
+  };
+}
+
+function simulateAdvancedAcceleration(params: {
+  debtBalance: number;
+  monthlyIncome: number;
+  monthlyExpenses: number;
+  monthlyDebtPayment: number;
+  locRate: number;
+}): VbScenario {
+  const locCashflow = Math.max(0, params.monthlyIncome - params.monthlyExpenses + params.monthlyDebtPayment);
+  let balance = params.debtBalance;
+  let months = 0;
+  let totalInterest = 0;
+
+  while (balance > 0.01 && months < 1200) {
+    const effectiveAverageBalance = Math.max(0, balance - locCashflow / 2);
+    const interest = effectiveAverageBalance * params.locRate / 12;
+    totalInterest += interest;
+    const principal = Math.max(0, locCashflow - interest);
+    if (principal <= 0.01) {
+      months = 1200;
+      break;
+    }
+    balance = Math.max(0, balance + interest - locCashflow);
+    months += 1;
+  }
+
+  return {
+    monthsToPayoff: months < 1200 ? months : null,
+    yearsToPayoff: months < 1200 ? months / 12 : null,
+    totalInterestPaid: round2(totalInterest),
+    effectiveInterestRate: params.locRate,
+  };
+}
+
+function buildVbComparison(params: {
+  debtBalance: number;
+  interestRate: number;
+  termMonths: number;
+  extraPayment: number;
+  monthlyIncome: number;
+  monthlyExpenses: number;
+  helocRate: number;
+  advancedRate: number;
+  helocLimit: number;
+  chunkMonths: number;
+}): VbComparison {
+  const amortizedDebt = simulateAmortizedDebt(params.debtBalance, params.interestRate, params.termMonths, 0);
+  const amortizedDebtWithExtraPayments = simulateAmortizedDebt(params.debtBalance, params.interestRate, params.termMonths, params.extraPayment);
+  const freeCashflow = Math.max(0, params.monthlyIncome - params.monthlyExpenses);
+  const basicAcceleration = simulateBasicAcceleration({
+    debtBalance: params.debtBalance,
+    interestRate: params.interestRate,
+    termMonths: params.termMonths,
+    helocRate: params.helocRate,
+    helocLimit: params.helocLimit,
+    freeCashflow,
+    chunkMonths: params.chunkMonths,
+  });
+  const payment = pmt(params.interestRate / 12, params.termMonths, params.debtBalance);
+  const advancedDebtAcceleration = simulateAdvancedAcceleration({
+    debtBalance: params.debtBalance,
+    monthlyIncome: params.monthlyIncome,
+    monthlyExpenses: params.monthlyExpenses,
+    monthlyDebtPayment: payment,
+    locRate: params.advancedRate,
+  });
+
+  const savings = {
+    extraPaymentsVsAmortized: round2(amortizedDebt.totalInterestPaid - amortizedDebtWithExtraPayments.totalInterestPaid),
+    basicAccelerationVsAmortized: round2(amortizedDebt.totalInterestPaid - basicAcceleration.totalInterestPaid),
+    advancedVsAmortized: round2(amortizedDebt.totalInterestPaid - advancedDebtAcceleration.totalInterestPaid),
+  };
+
+  const strategies = [
+    { key: "amortized" as const, scenario: amortizedDebt, savings: 0 },
+    { key: "extra_payments" as const, scenario: amortizedDebtWithExtraPayments, savings: savings.extraPaymentsVsAmortized },
+    { key: "basic_acceleration" as const, scenario: basicAcceleration, savings: savings.basicAccelerationVsAmortized },
+    { key: "advanced_acceleration" as const, scenario: advancedDebtAcceleration, savings: savings.advancedVsAmortized },
+  ];
+
+  strategies.sort((a, b) => {
+    const aMonths = a.scenario.monthsToPayoff ?? 999999;
+    const bMonths = b.scenario.monthsToPayoff ?? 999999;
+    if (aMonths !== bMonths) return aMonths - bMonths;
+    return b.savings - a.savings;
+  });
+
+  const best = strategies[0];
+  const chunkingMakesSense = freeCashflow > 0 && basicAcceleration.monthsToPayoff != null && amortizedDebt.monthsToPayoff != null
+    ? basicAcceleration.monthsToPayoff < amortizedDebt.monthsToPayoff && savings.basicAccelerationVsAmortized > 0
+    : false;
+  const advancedMakesSense = freeCashflow > 0 && advancedDebtAcceleration.monthsToPayoff != null && amortizedDebt.monthsToPayoff != null
+    ? advancedDebtAcceleration.monthsToPayoff < amortizedDebt.monthsToPayoff && savings.advancedVsAmortized > 0
+    : false;
+
+  let rationale = "Standard amortization remains the baseline.";
+  if (best.key === "extra_payments") {
+    rationale = `Extra monthly principal wins because it shortens payoff with $${savings.extraPaymentsVsAmortized.toLocaleString()} less interest than plain amortization.`;
+  } else if (best.key === "basic_acceleration") {
+    rationale = `Chunking/basic acceleration wins because free cashflow and chunk capacity reduce payoff time and save about $${savings.basicAccelerationVsAmortized.toLocaleString()} in interest.`;
+  } else if (best.key === "advanced_acceleration") {
+    rationale = `Advanced VB wins because cycling income through the lower-rate acceleration line beats plain amortization by about $${savings.advancedVsAmortized.toLocaleString()} in interest.`;
+  }
+
+  return {
+    amortizedDebt,
+    amortizedDebtWithExtraPayments,
+    debtWithBasicAcceleration: basicAcceleration,
+    advancedDebtAcceleration,
+    savings,
+    recommendation: {
+      bestStrategy: best.key,
+      rationale,
+      chunkingMakesSense,
+      advancedMakesSense,
+    },
+  };
+}
+
+function formatAnalyzeSummary(rows: FourSquareRow[]): string {
+  let out = "## Four-Square Spreadsheet-Compatible Analysis\n\n";
+  out += "| # | Address | MLS# | Offer | Cash Flow | CoC | Cap | DSCR | ROI | IRR |\n";
+  out += "|---|---------|------|-------|-----------|-----|-----|------|-----|-----|\n";
+  rows.forEach((row, idx) => {
+    out += `| ${idx + 1} | ${row.address} | ${row.mlsNumber} | $${row.offerPrice.toLocaleString()} | $${row.totalMonthlyCashFlow.toLocaleString()}/mo | ${(row.cashOnCashReturn * 100).toFixed(2)}% | ${(row.capitalizationRate * 100).toFixed(2)}% | ${row.debtServiceCoverageRatio != null ? row.debtServiceCoverageRatio.toFixed(2) : "—"} | ${(row.returnOnInvestment * 100).toFixed(2)}% | ${row.internalRateOfReturn != null ? (row.internalRateOfReturn * 100).toFixed(2) + "%" : "—"} |\n`;
+  });
+  out += `\n### Full rows (sheet-compatible columns)\n\n`;
+  out += "```json\n" + JSON.stringify(rows, null, 2) + "\n```";
+  return out;
+}
+
+function formatVbSummary(result: VbComparison): string {
+  const row = (name: string, scenario: VbScenario, savings = 0) =>
+    `| ${name} | ${scenario.yearsToPayoff != null ? scenario.yearsToPayoff.toFixed(2) : "—"} | $${scenario.totalInterestPaid.toLocaleString()} | ${scenario.effectiveInterestRate != null ? (scenario.effectiveInterestRate * 100).toFixed(2) + "%" : "—"} | $${savings.toLocaleString()} |`;
+
+  let out = "## Velocity Banking Comparison\n\n";
+  out += "| Strategy | Years to Pay Off | Total Interest | Effective Rate | Savings vs Amortized |\n";
+  out += "|----------|------------------|----------------|----------------|----------------------|\n";
+  out += row("Amortized Debt", result.amortizedDebt, 0) + "\n";
+  out += row("Amortized Debt w/ Extra Pmts", result.amortizedDebtWithExtraPayments, result.savings.extraPaymentsVsAmortized) + "\n";
+  out += row("Debt w/ Basic Acceleration", result.debtWithBasicAcceleration, result.savings.basicAccelerationVsAmortized) + "\n";
+  out += row("Advanced Debt Acceleration", result.advancedDebtAcceleration, result.savings.advancedVsAmortized) + "\n\n";
+  out += `- **Best strategy:** ${result.recommendation.bestStrategy}\n`;
+  out += `- **Chunking makes sense:** ${result.recommendation.chunkingMakesSense ? "yes" : "no"}\n`;
+  out += `- **Advanced VB makes sense:** ${result.recommendation.advancedMakesSense ? "yes" : "no"}\n`;
+  out += `- **Why:** ${result.recommendation.rationale}\n\n`;
+  out += "```json\n" + JSON.stringify(result, null, 2) + "\n```";
+  return out;
+}
 
 const server = new McpServer({
   name: "paragon-mls",
-  version: "1.0.0",
-  description: "Paragon MLS real estate API — fetch listings, parse property data, and analyze rental deals using the four-square method",
+  version: "1.1.0",
+  description: "Paragon MLS real estate API — fetch listings, parse property data, analyze deals with the Four-Square spreadsheet model, and compare velocity banking scenarios",
 });
 
-// Tool: fetch listings by MLS ID
 server.tool(
   "fetch_listings",
-  "Fetch property listings from a Paragon MLS system by listing GUID (MLS ID). Returns raw listing data including all available property fields.",
+  "Fetch property listings from a Paragon MLS system by listing GUID (MLS ID). Returns parsed property data including all available listing fields that the parser can extract.",
   {
     mlsId: z.string().describe("Paragon MLS listing GUID from paragonrels.com/fnimls.com URL (e.g. '6d70b762-36a4-4ac0-bedd-d0dae2920867')"),
     systemId: z.string().default("globalmls").describe("MLS system/region ID (subdomain of paragonrels.com, e.g. 'globalmls', 'imls', 'hudson')"),
@@ -457,12 +974,7 @@ server.tool(
         .filter((p): p is PropertyInfo => p != null);
 
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({ count: parsed.length, properties: parsed }, null, 2),
-          },
-        ],
+        content: [{ type: "text" as const, text: JSON.stringify({ count: parsed.length, properties: parsed }, null, 2) }],
       };
     } catch (err) {
       return { content: [{ type: "text" as const, text: `Error fetching listings: ${String(err)}` }], isError: true };
@@ -470,10 +982,9 @@ server.tool(
   }
 );
 
-// Tool: fetch a single property by MLS number
 server.tool(
   "fetch_property",
-  "Fetch a single property by MLS number and system ID. Returns parsed property data with address, price, beds, baths, rents, taxes, etc.",
+  "Fetch a single property by MLS number and system ID. Returns parsed property data with address, price, beds, baths, rents, taxes, and sheet-friendly descriptors.",
   {
     mlsNumber: z.string().describe("MLS number for the property (e.g. '201918514')"),
     systemId: z.string().default("globalmls").describe("MLS system/region ID (subdomain of paragonrels.com)"),
@@ -482,10 +993,7 @@ server.tool(
   async ({ mlsNumber, systemId, mlsId }) => {
     try {
       const guid = mlsId ?? "";
-      const agentId = "1";
-      const officeId = "1";
-      const rawProperties = await getProperties([mlsNumber], systemId, guid || mlsNumber, agentId, officeId);
-
+      const rawProperties = await getProperties([mlsNumber], systemId, guid || mlsNumber, "1", "1");
       if (rawProperties.length === 0) {
         return { content: [{ type: "text" as const, text: `No data returned for MLS #${mlsNumber}` }] };
       }
@@ -495,117 +1003,77 @@ server.tool(
         return { content: [{ type: "text" as const, text: `Could not parse property data for MLS #${mlsNumber}. Raw data returned instead.` }] };
       }
 
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(parsed, null, 2) }],
-      };
+      return { content: [{ type: "text" as const, text: JSON.stringify(parsed, null, 2) }] };
     } catch (err) {
       return { content: [{ type: "text" as const, text: `Error fetching property: ${String(err)}` }], isError: true };
     }
   }
 );
 
-// Tool: four-square analysis
 server.tool(
   "analyze_deal",
-  "Perform a four-square rental property analysis on one or more properties. Computes monthly income, expenses, cash flow, cash-on-cash return, and cap rate.",
-  {
-    mlsNumbers: z.string().describe("Comma-separated MLS numbers to analyze (e.g. '201918514,202012345')"),
-    systemId: z.string().default("globalmls").describe("MLS system/region ID"),
-    mlsId: z.string().optional().describe("Optional listing GUID for link generation"),
-    downPaymentPct: z.number().default(0.20).describe("Down payment percentage (default 0.20 = 20%)"),
-    interestRate: z.number().default(0.07).describe("Mortgage interest rate (default 0.07 = 7%)"),
-    loanTermYears: z.number().default(30).describe("Loan term in years (default 30)"),
-    vacancyRate: z.number().default(0.05).describe("Vacancy rate estimate (default 0.05 = 5%)"),
-    repairPct: z.number().default(0.05).describe("Repair budget as % of income (default 0.05)"),
-    capexPct: z.number().default(0.05).describe("Capex budget as % of income (default 0.05)"),
-    mgmtPct: z.number().default(0.08).describe("Property management as % of income (default 0.08)"),
-  },
-  async ({ mlsNumbers, systemId, mlsId, downPaymentPct, interestRate, loanTermYears, vacancyRate, repairPct, capexPct, mgmtPct }) => {
+  "Perform a spreadsheet-compatible Four-Square rental analysis using the Google Sheet model. Returns all major columns from the Four-Square Analysis tab, including NOI, DSCR, principal paydown, appreciation, depreciation, ROI, ROE, and IRR.",
+  analyzeDealSchema,
+  async (input) => {
     try {
-      const numbers = mlsNumbers.split(",").map((s) => s.trim()).filter(Boolean);
-      const guid = mlsId ?? "";
-      const rawProperties = await getProperties(numbers, systemId, guid, "1", "1");
+      const numbers = input.mlsNumbers.split(",").map((s) => s.trim()).filter(Boolean);
+      const guid = input.mlsId ?? "";
+      const rawProperties = await getProperties(numbers, input.systemId, guid, "1", "1");
 
-      const analyses: FourSquareAnalysis[] = [];
-      for (let i = 0; i < rawProperties.length; i++) {
-        const parsed = parseProperty(rawProperties[i] as Record<string, unknown>, systemId, guid);
+      const rows: FourSquareRow[] = [];
+      for (const raw of rawProperties) {
+        const parsed = parseProperty(raw as Record<string, unknown>, input.systemId, guid);
         if (!parsed) continue;
-
-        const analysis = computeFourSquare(parsed);
-
-        // Add mortgage calculation if we have a price
-        if (parsed.priceCurrent != null) {
-          const loanAmount = parsed.priceCurrent * (1 - downPaymentPct);
-          const monthlyRate = interestRate / 12;
-          const nPayments = loanTermYears * 12;
-          const monthlyMortgage = (loanAmount * monthlyRate * Math.pow(1 + monthlyRate, nPayments)) /
-            (Math.pow(1 + monthlyRate, nPayments) - 1);
-          analysis.monthlyMortgage = Math.round(monthlyMortgage);
-          analysis.totalMonthlyExpenses += analysis.monthlyMortgage;
-          analysis.monthlyCashFlow = analysis.totalMonthlyIncome - analysis.totalMonthlyExpenses;
-          analysis.annualCashFlow = analysis.monthlyCashFlow * 12;
-          const dp = Math.round(parsed.priceCurrent * downPaymentPct);
-          const cc = Math.round(parsed.priceCurrent * 0.03);
-          analysis.totalInvestment = dp + cc;
-          analysis.cashOnCashReturn = analysis.totalInvestment > 0
-            ? Math.round((analysis.annualCashFlow / analysis.totalInvestment) * 10000) / 100
-            : null;
-        }
-
-        analyses.push(analysis);
+        rows.push(buildFourSquareRow(parsed, input));
       }
 
-      if (analyses.length === 0) {
+      if (rows.length === 0) {
         return { content: [{ type: "text" as const, text: "No active properties found for the given MLS numbers." }] };
       }
 
-      // Summary table
-      let summary = `## Four-Square Analysis Results\n\n`;
-      summary += `| # | Address | MLS# | List | Offer | Income | Expenses | Cash Flow | CoC% | Cap% |\n`;
-      summary += `|---|---------|------|------|-------|--------|----------|-----------|------|------|\n`;
-      for (let i = 0; i < analyses.length; i++) {
-        const a = analyses[i];
-        summary += `| ${i + 1} | ${a.address} | ${a.mlsNumber} | $${a.listPrice?.toLocaleString() ?? "—"} | $${a.offerPrice?.toLocaleString() ?? "—"} | $${a.totalMonthlyIncome.toLocaleString()}/mo | $${a.totalMonthlyExpenses.toLocaleString()}/mo | $${a.monthlyCashFlow?.toLocaleString() ?? "—"}/mo | ${a.cashOnCashReturn ?? "—"}% | ${a.capRate ?? "—"}% |\n`;
-      }
-
-      summary += `\n### Detailed Results\n\n`;
-      for (const a of analyses) {
-        summary += `#### ${a.address} (MLS# ${a.mlsNumber})\n`;
-        summary += `- **Status**: ${a.status ?? "Unknown"}\n`;
-        summary += `- **List Price**: $${a.listPrice?.toLocaleString() ?? "N/A"}\n`;
-        summary += `- **Offer Price** (85% of list): $${a.offerPrice?.toLocaleString() ?? "N/A"}\n`;
-        summary += `- **Bed/Bath**: ${a.beds ?? "?"} BD / ${a.baths ?? "?"} BA\n`;
-        summary += `- **Sq Ft**: ${a.sqft?.toLocaleString() ?? "N/A"}\n`;
-        summary += `- **Year Built**: ${a.yearBuilt ?? "N/A"}\n`;
-        summary += `- **Rents**: ${Object.entries(a.rents).filter(([, v]) => v != null).map(([k, v]) => `${k}: $${v!.toLocaleString()}`).join(", ") || "N/A"}\n`;
-        summary += `- **Monthly Income**: $${a.totalMonthlyIncome.toLocaleString()}\n`;
-        summary += `- **Monthly Expenses**: $${a.totalMonthlyExpenses.toLocaleString()}\n`;
-        summary += `  - Taxes: $${a.monthlyTaxes.toLocaleString()}\n`;
-        summary += `  - Insurance: $${a.monthlyInsurance.toLocaleString()}\n`;
-        summary += `  - Mortgage: $${a.monthlyMortgage?.toLocaleString() ?? "N/A"}\n`;
-        summary += `  - Vacancy (${(vacancyRate * 100).toFixed(0)}%): $${Math.round(a.totalMonthlyIncome * vacancyRate).toLocaleString()}\n`;
-        summary += `  - Repairs (${(repairPct * 100).toFixed(0)}%): $${Math.round(a.totalMonthlyIncome * repairPct).toLocaleString()}\n`;
-        summary += `  - CapEx (${(capexPct * 100).toFixed(0)}%): $${Math.round(a.totalMonthlyIncome * capexPct).toLocaleString()}\n`;
-        summary += `  - Management (${(mgmtPct * 100).toFixed(0)}%): $${Math.round(a.totalMonthlyIncome * mgmtPct).toLocaleString()}\n`;
-        summary += `- **Monthly Cash Flow**: $${a.monthlyCashFlow?.toLocaleString() ?? "N/A"}\n`;
-        summary += `- **Annual Cash Flow**: $${a.annualCashFlow?.toLocaleString() ?? "N/A"}\n`;
-        summary += `- **Total Investment**: $${a.totalInvestment?.toLocaleString() ?? "N/A"}\n`;
-        summary += `- **Cash-on-Cash Return**: ${a.cashOnCashReturn ?? "N/A"}%\n`;
-        summary += `- **Cap Rate**: ${a.capRate ?? "N/A"}%\n`;
-        if (a.publicRemarks) {
-          summary += `- **Remarks**: ${a.publicRemarks.slice(0, 300)}${a.publicRemarks.length > 300 ? "..." : ""}\n`;
-        }
-        summary += `\n`;
-      }
-
-      return { content: [{ type: "text" as const, text: summary }] };
+      return { content: [{ type: "text" as const, text: formatAnalyzeSummary(rows) }] };
     } catch (err) {
       return { content: [{ type: "text" as const, text: `Error analyzing deal: ${String(err)}` }], isError: true };
     }
   }
 );
 
-// Tool: search raw listings by MLS numbers (returns raw JSON)
+server.tool(
+  "vb_calc",
+  "Compare amortized debt, extra payments, chunking/basic acceleration, and advanced velocity banking. This is designed to pair with the Four-Square spreadsheet outputs so you can decide if chunking or advanced VB makes sense for a deal.",
+  {
+    debtBalance: z.number().describe("Starting debt or mortgage balance"),
+    interestRate: z.number().describe("Amortized debt annual interest rate, e.g. 0.07 for 7%"),
+    loanTermYears: z.number().default(30).describe("Debt term in years"),
+    extraPayment: z.number().default(0).describe("Extra monthly principal payment for the extra-payment scenario"),
+    monthlyIncome: z.number().describe("Monthly income feeding the debt strategy"),
+    monthlyExpenses: z.number().describe("Monthly expenses, typically including the current debt payment when mirroring the spreadsheet"),
+    helocRate: z.number().default(0.2399).describe("Rate for the chunking / basic acceleration account"),
+    advancedRate: z.number().default(0.08).describe("Rate for the advanced debt acceleration / VB account"),
+    helocLimit: z.number().default(20000).describe("Line limit available for chunking"),
+    chunkMonths: z.number().default(6).describe("Chunk frequency in months"),
+  },
+  async ({ debtBalance, interestRate, loanTermYears, extraPayment, monthlyIncome, monthlyExpenses, helocRate, advancedRate, helocLimit, chunkMonths }) => {
+    try {
+      const comparison = buildVbComparison({
+        debtBalance,
+        interestRate,
+        termMonths: Math.round(loanTermYears * 12),
+        extraPayment,
+        monthlyIncome,
+        monthlyExpenses,
+        helocRate,
+        advancedRate,
+        helocLimit,
+        chunkMonths,
+      });
+      return { content: [{ type: "text" as const, text: formatVbSummary(comparison) }] };
+    } catch (err) {
+      return { content: [{ type: "text" as const, text: `Error running vb_calc: ${String(err)}` }], isError: true };
+    }
+  }
+);
+
 server.tool(
   "raw_listings",
   "Fetch raw JSON data from the Paragon MLS API for one or more MLS numbers. Returns unprocessed listing data for custom analysis.",
@@ -617,24 +1085,13 @@ server.tool(
     try {
       const numbers = mlsNumbers.split(",").map((s) => s.trim()).filter(Boolean);
       const rawProperties = await getProperties(numbers, systemId, "", "1", "1");
-
-      // Sanitize: remove any auth tokens or cookies from output
-      const sanitized = rawProperties.map((p) => {
-        const s = JSON.stringify(p);
-        // Remove potential cookie/auth data
-        return JSON.parse(s.replace(/"Cookie"[^"]*"/g, ""));
-      });
-
+      const sanitized = rawProperties.map((p) => JSON.parse(JSON.stringify(p).replace(/"Cookie"[^\"]*"/g, "")));
       return { content: [{ type: "text" as const, text: JSON.stringify(sanitized, null, 2) }] };
     } catch (err) {
       return { content: [{ type: "text" as const, text: `Error fetching raw listings: ${String(err)}` }], isError: true };
     }
   }
 );
-
-// ---------------------------------------------------------------------------
-// Start Server
-// ---------------------------------------------------------------------------
 
 async function main() {
   const transport = new StdioServerTransport();

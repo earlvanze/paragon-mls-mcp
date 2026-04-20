@@ -40,11 +40,14 @@ mcporter call paragon-mls.fetch_listings mlsId="6d70b762-36a4-4ac0-bedd-d0dae292
 # Fetch a single property by MLS number
 mcporter call paragon-mls.fetch_property mlsNumber="201918514" systemId="globalmls"
 
-# Analyze a deal with four-square method
-mcporter call paragon-mls.analyze_deal mlsNumbers="201918514" systemId="globalmls"
+# Analyze a deal with the spreadsheet-compatible Four-Square model
+mcporter call paragon-mls.analyze_deal mlsNumbers="201918514" systemId="globalmls" holdingPeriodYears:5 downPaymentPct:0.25
 
 # Analyze multiple properties with custom assumptions
-mcporter call paragon-mls.analyze_deal mlsNumbers="201918514,202012345" systemId="globalmls" downPaymentPct:0.25 interestRate:0.065
+mcporter call paragon-mls.analyze_deal mlsNumbers="201918514,202012345" systemId="globalmls" downPaymentPct:0.25 interestRate:0.065 monthlyInsurance:250 repairBudget:10000 landValue:35000
+
+# Compare velocity banking strategies for a deal
+mcporter call paragon-mls.vb_calc debtBalance:350000 interestRate:0.05 loanTermYears:30 monthlyIncome:8000 monthlyExpenses:4878.875681 extraPayment:1000
 
 # Get raw JSON data
 mcporter call paragon-mls.raw_listings mlsNumbers="201918514" systemId="globalmls"
@@ -66,18 +69,34 @@ Fetch a single property by its MLS number. Returns structured property data.
 - **mlsId** (optional): Listing GUID for link generation
 
 ### `analyze_deal`
-Perform a full four-square rental analysis on one or more properties. Computes monthly income, expenses, cash flow, cash-on-cash return, and cap rate.
+Perform a spreadsheet-compatible Four-Square analysis on one or more properties. Returns the major columns from the Google Sheet, including NOI, DSCR, principal paydown, appreciation, depreciation, ROI, ROE, and IRR.
 
+Key inputs:
 - **mlsNumbers** (required): Comma-separated MLS numbers
 - **systemId** (default: `globalmls`): MLS region ID
-- **mlsId** (optional): Listing GUID
-- **downPaymentPct** (default: 0.20): Down payment percentage
-- **interestRate** (default: 0.07): Mortgage interest rate
-- **loanTermYears** (default: 30): Loan term in years
-- **vacancyRate** (default: 0.05): Vacancy rate estimate
-- **repairPct** (default: 0.05): Repair budget as % of income
-- **capexPct** (default: 0.05): CapEx budget as % of income
-- **mgmtPct** (default: 0.08): Property management as % of income
+- **holdingPeriodYears** (default: `5`)
+- **offerPricePct** (default: `1`)
+- **downPaymentPct** (default: `0.20`)
+- **interestRate** (default: `0.07`)
+- **loanTermYears** (default: `30`)
+- **vacancyRate / repairsPct / capexPct / mgmtPct** for recurring expense assumptions
+- **closingCosts / repairBudget / reservePrepaid / privateMoneyLender / landValue** for capital stack and tax assumptions
+- **monthlyPropertyTaxes / monthlySchoolTaxes / monthlyInsurance / monthlyWater / monthlySewer / monthlyGarbage / monthlyElectric / monthlyGas / monthlyHoa / monthlyLawnSnow / monthlyLegalAccounting** for direct spreadsheet column overrides
+- **unitRent1..unitRent7 / laundryIncome / storageIncome / miscIncome** for income overrides
+
+### `vb_calc`
+Compare amortized debt, extra payments, chunking/basic acceleration, and advanced velocity banking.
+
+- **debtBalance** (required)
+- **interestRate** (required)
+- **loanTermYears** (default: `30`)
+- **extraPayment** (default: `0`)
+- **monthlyIncome** (required)
+- **monthlyExpenses** (required)
+- **helocRate** (default: `0.2399`)
+- **advancedRate** (default: `0.08`)
+- **helocLimit** (default: `20000`)
+- **chunkMonths** (default: `6`)
 
 ### `raw_listings`
 Fetch raw JSON data from the Paragon API for custom analysis. Returns unprocessed listing data.
