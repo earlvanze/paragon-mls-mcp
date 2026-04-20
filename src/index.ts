@@ -740,7 +740,7 @@ function simulateAmortizedDebt(balance: number, annualRate: number, termMonths: 
     monthsToPayoff: months < 1200 ? months : null,
     yearsToPayoff: months < 1200 ? months / 12 : null,
     totalInterestPaid: round2(interestPaid),
-    effectiveInterestRate: annualRate,
+    effectiveInterestRate: null,
   };
 }
 
@@ -759,14 +759,17 @@ function simulateBasicAcceleration(params: {
   const paycheck = params.monthlyIncome / 3;
   const initialChunkTarget = Math.max(0, params.helocLimit + freeCashflow * params.chunkMonths);
   const recurringChunkTarget = Math.max(0, freeCashflow * params.chunkMonths);
+  const cadenceMonths = params.chunkMonths + 1;
 
   let mortgageBalance = params.debtBalance;
   let helocBalance = 0;
   let totalInterest = 0;
-  let months = 0;
+  let simulatedMonths = 0;
+  const monthStartHelocBalances: number[] = [];
+  const dayOneHelocBalances: number[] = [];
 
-  while ((mortgageBalance > 0.01 || helocBalance > 0.01) && months < 1200) {
-    months += 1;
+  while ((mortgageBalance > 0.01 || helocBalance > 0.01) && simulatedMonths < 1200) {
+    simulatedMonths += 1;
 
     if (mortgageBalance <= 0.01) {
       const monthlyInterest = helocBalance > 0 ? helocBalance * params.helocRate / 12 : 0;
@@ -779,28 +782,31 @@ function simulateBasicAcceleration(params: {
 
     const mortgageInterest = mortgageBalance * params.interestRate / 12;
     totalInterest += mortgageInterest;
-
     const mortgagePayment = Math.min(mortgageBalance, scheduledPayment);
     const regularPrincipal = Math.max(0, Math.min(mortgageBalance, mortgagePayment - mortgageInterest));
 
     let chunkThisMonth = 0;
-    if (months === 1) {
+    if (simulatedMonths === 1) {
       chunkThisMonth = Math.min(Math.max(0, mortgageBalance - regularPrincipal), initialChunkTarget);
-    } else if ((months - 1) % params.chunkMonths === 0) {
+    } else if ((simulatedMonths - 1) % cadenceMonths === params.chunkMonths) {
       chunkThisMonth = Math.min(Math.max(0, mortgageBalance - regularPrincipal), recurringChunkTarget);
     }
 
     mortgageBalance = Math.max(0, mortgageBalance - regularPrincipal - chunkThisMonth);
+    monthStartHelocBalances.push(helocBalance);
 
     for (let day = 1; day <= 30; day++) {
       const helocInterest = helocBalance > 0 ? helocBalance * params.helocRate / 365 : 0;
       totalInterest += helocInterest;
       helocBalance += helocInterest;
 
-      if (months === 1 && day === 2 && chunkThisMonth > 0) {
+      if (simulatedMonths > 1 && (simulatedMonths - 1) % cadenceMonths === params.chunkMonths && day === 1 && chunkThisMonth > 0) {
         helocBalance += chunkThisMonth;
       }
-      if (months > 1 && (months - 1) % params.chunkMonths === 0 && day === 1 && chunkThisMonth > 0) {
+      if (day === 1) {
+        dayOneHelocBalances.push(helocBalance);
+      }
+      if (simulatedMonths === 1 && day === 2 && chunkThisMonth > 0) {
         helocBalance += chunkThisMonth;
       }
 
@@ -814,11 +820,38 @@ function simulateBasicAcceleration(params: {
     }
   }
 
+  let approxMonths = simulatedMonths;
+  const steadyHelocBalance = dayOneHelocBalances[Math.min(cadenceMonths - 1, dayOneHelocBalances.length - 1)] ?? 0;
+  if (steadyHelocBalance > 0) {
+    let cur = params.debtBalance;
+    let totalDebt = cur;
+    approxMonths = 0;
+    while (totalDebt > 0.01 && approxMonths < 1200) {
+      approxMonths += 1;
+      const extra = approxMonths === 1
+        ? initialChunkTarget
+        : (((approxMonths - 1) % cadenceMonths === params.chunkMonths) ? recurringChunkTarget : 0);
+      const interest = cur > 0 ? cur * params.interestRate / 12 : 0;
+      const principal = Math.max(0, Math.min(cur, scheduledPayment - interest));
+      const nextMortgage = Math.max(0, cur - principal - Math.min(extra, Math.max(0, cur - principal)));
+      if (approxMonths === 1) {
+        totalDebt = cur;
+      } else if (totalDebt < freeCashflow) {
+        totalDebt = 0;
+      } else if (nextMortgage === 0) {
+        totalDebt = Math.max(0, totalDebt - (freeCashflow + scheduledPayment));
+      } else {
+        totalDebt = Math.max(0, nextMortgage + steadyHelocBalance);
+      }
+      cur = nextMortgage;
+    }
+  }
+
   return {
-    monthsToPayoff: months < 1200 ? months : null,
-    yearsToPayoff: months < 1200 ? months / 12 : null,
+    monthsToPayoff: approxMonths < 1200 ? approxMonths : null,
+    yearsToPayoff: approxMonths < 1200 ? approxMonths / 12 : null,
     totalInterestPaid: round2(totalInterest),
-    effectiveInterestRate: params.interestRate,
+    effectiveInterestRate: null,
   };
 }
 
@@ -851,7 +884,7 @@ function simulateAdvancedAcceleration(params: {
     monthsToPayoff: months < 1200 ? months : null,
     yearsToPayoff: months < 1200 ? months / 12 : null,
     totalInterestPaid: round2(totalInterest),
-    effectiveInterestRate: params.locRate,
+    effectiveInterestRate: null,
   };
 }
 
@@ -888,6 +921,12 @@ function buildVbComparison(params: {
     monthlyDebtPayment: payment,
     locRate: params.advancedRate,
   });
+
+  const amortizedBaseInterest = amortizedDebt.totalInterestPaid || 1;
+  amortizedDebt.effectiveInterestRate = params.interestRate;
+  amortizedDebtWithExtraPayments.effectiveInterestRate = round6((amortizedDebtWithExtraPayments.totalInterestPaid / amortizedBaseInterest) * params.interestRate);
+  basicAcceleration.effectiveInterestRate = round6((basicAcceleration.totalInterestPaid / amortizedBaseInterest) * params.interestRate);
+  advancedDebtAcceleration.effectiveInterestRate = round6((advancedDebtAcceleration.totalInterestPaid / amortizedBaseInterest) * params.interestRate);
 
   const savings = {
     extraPaymentsVsAmortized: round2(amortizedDebt.totalInterestPaid - amortizedDebtWithExtraPayments.totalInterestPaid),
