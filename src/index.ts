@@ -750,45 +750,67 @@ function simulateBasicAcceleration(params: {
   termMonths: number;
   helocRate: number;
   helocLimit: number;
-  freeCashflow: number;
+  monthlyIncome: number;
+  monthlyExpenses: number;
   chunkMonths: number;
 }): VbScenario {
-  const payment = pmt(params.interestRate / 12, params.termMonths, params.debtBalance);
+  const scheduledPayment = pmt(params.interestRate / 12, params.termMonths, params.debtBalance);
+  const freeCashflow = Math.max(0, params.monthlyIncome - params.monthlyExpenses);
+  const paycheck = params.monthlyIncome / 3;
+  const initialChunkTarget = Math.max(0, params.helocLimit + freeCashflow * params.chunkMonths);
+  const recurringChunkTarget = Math.max(0, freeCashflow * params.chunkMonths);
+
   let mortgageBalance = params.debtBalance;
   let helocBalance = 0;
-  let months = 0;
   let totalInterest = 0;
-  const recurringChunk = Math.max(0, params.freeCashflow * params.chunkMonths);
-  const initialChunk = Math.min(mortgageBalance, Math.max(0, params.helocLimit + recurringChunk));
-  if (initialChunk > 0) {
-    mortgageBalance -= initialChunk;
-    helocBalance += initialChunk;
-  }
+  let months = 0;
 
   while ((mortgageBalance > 0.01 || helocBalance > 0.01) && months < 1200) {
     months += 1;
 
-    if (mortgageBalance > 0.01) {
-      const mortgageInterest = mortgageBalance * params.interestRate / 12;
-      totalInterest += mortgageInterest;
-      const mortgagePayment = Math.min(mortgageBalance + mortgageInterest, payment);
-      const mortgagePrincipal = Math.max(0, mortgagePayment - mortgageInterest);
-      mortgageBalance = Math.max(0, mortgageBalance - mortgagePrincipal);
+    if (mortgageBalance <= 0.01) {
+      const monthlyInterest = helocBalance > 0 ? helocBalance * params.helocRate / 12 : 0;
+      totalInterest += monthlyInterest;
+      helocBalance += monthlyInterest;
+      const availableAfterMortgage = Math.max(0, params.monthlyIncome - Math.max(0, params.monthlyExpenses - scheduledPayment));
+      helocBalance = Math.max(0, helocBalance - availableAfterMortgage);
+      continue;
     }
 
-    const helocInterest = helocBalance > 0 ? helocBalance * params.helocRate / 12 : 0;
-    totalInterest += helocInterest;
-    helocBalance += helocInterest;
+    const mortgageInterest = mortgageBalance * params.interestRate / 12;
+    totalInterest += mortgageInterest;
 
-    if (params.freeCashflow > 0 && helocBalance > 0) {
-      const payHeloc = Math.min(helocBalance, params.freeCashflow);
-      helocBalance -= payHeloc;
+    const mortgagePayment = Math.min(mortgageBalance, scheduledPayment);
+    const regularPrincipal = Math.max(0, Math.min(mortgageBalance, mortgagePayment - mortgageInterest));
+
+    let chunkThisMonth = 0;
+    if (months === 1) {
+      chunkThisMonth = Math.min(Math.max(0, mortgageBalance - regularPrincipal), initialChunkTarget);
+    } else if ((months - 1) % params.chunkMonths === 0) {
+      chunkThisMonth = Math.min(Math.max(0, mortgageBalance - regularPrincipal), recurringChunkTarget);
     }
 
-    if (mortgageBalance > 0.01 && recurringChunk > 0 && months % (params.chunkMonths + 1) === 0) {
-      const chunk = Math.min(mortgageBalance, recurringChunk);
-      mortgageBalance -= chunk;
-      helocBalance += chunk;
+    mortgageBalance = Math.max(0, mortgageBalance - regularPrincipal - chunkThisMonth);
+
+    for (let day = 1; day <= 30; day++) {
+      const helocInterest = helocBalance > 0 ? helocBalance * params.helocRate / 365 : 0;
+      totalInterest += helocInterest;
+      helocBalance += helocInterest;
+
+      if (months === 1 && day === 2 && chunkThisMonth > 0) {
+        helocBalance += chunkThisMonth;
+      }
+      if (months > 1 && (months - 1) % params.chunkMonths === 0 && day === 1 && chunkThisMonth > 0) {
+        helocBalance += chunkThisMonth;
+      }
+
+      if (day === 7 || day === 14 || day === 21) {
+        helocBalance = Math.max(0, helocBalance - paycheck);
+      }
+
+      if (day === 30) {
+        helocBalance += params.monthlyExpenses;
+      }
     }
   }
 
@@ -854,7 +876,8 @@ function buildVbComparison(params: {
     termMonths: params.termMonths,
     helocRate: params.helocRate,
     helocLimit: params.helocLimit,
-    freeCashflow,
+    monthlyIncome: params.monthlyIncome,
+    monthlyExpenses: params.monthlyExpenses,
     chunkMonths: params.chunkMonths,
   });
   const payment = pmt(params.interestRate / 12, params.termMonths, params.debtBalance);

@@ -1,6 +1,6 @@
 {
   "name": "paragon-mls-mcp",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "MCP server for Paragon MLS real estate API — fetch listings, run spreadsheet-compatible deal analysis, and compare velocity banking strategies",
   "type": "module",
   "main": "dist/index.js",
