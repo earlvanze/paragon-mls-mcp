@@ -1,0 +1,26 @@
+{
+  "name": "paragon-mls-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Paragon MLS real estate API — fetch listings, parse property data, and analyze rental deals",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "paragon-mls-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js",
+    "inspect": "npx @modelcontextprotocol/inspector dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT"
+}
